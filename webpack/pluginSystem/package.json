@@ -1,0 +1,28 @@
+{
+  "name": "plugin-system",
+  "version": "1.0.0",
+  "description": "一个功能完整、易于扩展的 TypeScript 插件系统",
+  "main": "dist/src/index.js",
+  "types": "dist/src/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "demo": "npm run build && node dist/demo.js",
+    "demo:ts": "ts-node demo.ts",
+    "clean": "rm -rf dist"
+  },
+  "keywords": [
+    "plugin",
+    "plugin-system",
+    "hooks",
+    "event-driven",
+    "typescript"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.0.0"
+  }
+}
