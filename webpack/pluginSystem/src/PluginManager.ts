@@ -10,7 +10,7 @@ import type {
   PluginContext,
   IPlugin,
   IPluginManager,
-} from '../types';
+} from "../types";
 
 export class PluginManager implements IPluginManager {
   private plugins: IPlugin[] = [];
@@ -20,15 +20,23 @@ export class PluginManager implements IPluginManager {
   /**
    * 注册钩子
    * @param hookName - 钩子名称
-   * @param type - 钩子类型: 'sync' | 'async' | 'waterfall' | 'bail'
+   * @param type - 钩子类型: 'sync' | 'asyncSeries' | 'asyncParallel' | 'waterfall' | 'bail'
    */
-  registerHook(hookName: string, type: HookType = 'sync'): this {
-    if (!this.hooks.has(hookName)) {
-      this.hooks.set(hookName, {
-        type,
-        callbacks: [],
-      });
+  registerHook(hookName: string, type: HookType): this {
+    const existing = this.hooks.get(hookName);
+    if (existing) {
+      if (existing.type !== type) {
+        throw new Error(
+          `Hook "${hookName}" already registered as "${existing.type}", cannot re-register as "${type}"`
+        );
+      }
+      return this;
     }
+
+    this.hooks.set(hookName, {
+      type,
+      callbacks: [],
+    });
     return this;
   }
 
@@ -37,13 +45,13 @@ export class PluginManager implements IPluginManager {
    * @param plugin - 插件实例
    */
   use(plugin: IPlugin): this {
-    if (typeof plugin.apply !== 'function') {
+    if (typeof plugin.apply !== "function") {
       throw new Error('Plugin must have an "apply" method');
     }
 
     // 检查是否已注册
     if (this.plugins.includes(plugin)) {
-      console.warn('Plugin already registered:', plugin.name || 'Anonymous');
+      console.warn("Plugin already registered:", plugin.name || "Anonymous");
       return this;
     }
 
@@ -71,11 +79,10 @@ export class PluginManager implements IPluginManager {
     callback: HookCallback<T, R>,
     priority: number = 10
   ): this {
-    if (!this.hooks.has(hookName)) {
-      this.registerHook(hookName);
+    const hook = this.hooks.get(hookName);
+    if (!hook) {
+      throw new Error(`Hook "${hookName}" is not registered`);
     }
-
-    const hook = this.hooks.get(hookName)!;
     hook.callbacks.push({ callback, priority });
 
     // 按优先级排序
@@ -95,7 +102,7 @@ export class PluginManager implements IPluginManager {
       return;
     }
 
-    if (hook.type !== 'sync') {
+    if (hook.type !== "sync") {
       throw new Error(`Hook "${hookName}" is not a sync hook`);
     }
 
@@ -105,7 +112,7 @@ export class PluginManager implements IPluginManager {
   }
 
   /**
-   * 调用异步钩子（并行）
+   * 调用异步钩子（串行或并行取决于类型）
    * @param hookName - 钩子名称
    * @param args - 传递给钩子的参数
    */
@@ -115,13 +122,21 @@ export class PluginManager implements IPluginManager {
       return;
     }
 
-    if (hook.type !== 'async') {
-      throw new Error(`Hook "${hookName}" is not an async hook`);
+    if (hook.type === "asyncParallel") {
+      await Promise.all(
+        hook.callbacks.map(({ callback }) => callback(...args))
+      );
+      return;
     }
 
-    await Promise.all(
-      hook.callbacks.map(({ callback }) => callback(...args))
-    );
+    if (hook.type === "asyncSeries") {
+      for (const { callback } of hook.callbacks) {
+        await callback(...args);
+      }
+      return;
+    }
+
+    throw new Error(`Hook "${hookName}" is not an async hook`);
   }
 
   /**
@@ -136,7 +151,7 @@ export class PluginManager implements IPluginManager {
       return initialValue;
     }
 
-    if (hook.type !== 'waterfall') {
+    if (hook.type !== "waterfall") {
       throw new Error(`Hook "${hookName}" is not a waterfall hook`);
     }
 
@@ -160,7 +175,7 @@ export class PluginManager implements IPluginManager {
       return undefined;
     }
 
-    if (hook.type !== 'bail') {
+    if (hook.type !== "bail") {
       throw new Error(`Hook "${hookName}" is not a bail hook`);
     }
 

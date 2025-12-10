@@ -5,7 +5,7 @@
 ## ✨ 特性
 
 - ✅ **完整的 TypeScript 支持** - 类型安全、智能提示
-- ✅ **四种钩子类型** - sync、async、waterfall、bail
+- ✅ **多种钩子类型** - sync、asyncSeries、asyncParallel、waterfall、bail
 - ✅ **优先级机制** - 精确控制插件执行顺序
 - ✅ **上下文共享** - 插件间数据传递
 - ✅ **生命周期管理** - 初始化和销毁钩子
@@ -26,12 +26,13 @@
 
 ### 3. Hook（钩子）
 
-钩子是插件系统的事件机制，支持四种类型：
+钩子是插件系统的事件机制，支持五种类型：
 
 | 类型 | 说明 | 使用场景 |
 |------|------|----------|
 | **sync** | 同步钩子，按顺序执行所有回调 | 简单的同步操作、日志记录 |
-| **async** | 异步钩子，并行执行所有回调 | 并行的异步操作、网络请求 |
+| **asyncSeries** | 异步串行钩子，按顺序 await | 有顺序依赖的异步任务 |
+| **asyncParallel** | 异步并行钩子，Promise.all 执行 | 并行的异步操作、网络请求 |
 | **waterfall** | 瀑布流钩子，结果链式传递 | 数据转换管道、中间件 |
 | **bail** | 熔断钩子，有返回值则停止 | 数据验证、短路判断 |
 
@@ -97,7 +98,7 @@ const manager = new PluginManager();
 
 ```typescript
 manager.registerHook('beforeStart', 'sync');
-manager.registerHook('start', 'async');
+manager.registerHook('start', 'asyncSeries');
 manager.registerHook('transform', 'waterfall');
 manager.registerHook('validate', 'bail');
 ```
@@ -125,7 +126,7 @@ class MyPlugin extends Plugin<MyPluginOptions> {
       console.log(prefix, '应用启动前', data);
     });
 
-    // 订阅异步钩子
+    // 订阅异步串行钩子
     manager.tap('start', async (data: any) => {
       console.log(prefix, '应用启动中', data);
       await someAsyncOperation();
@@ -151,7 +152,7 @@ await manager.callAsync('start', { port: 3000 });
 
 #### 方法
 
-##### `registerHook(hookName: string, type?: HookType): this`
+##### `registerHook(hookName: string, type: HookType): this`
 
 注册一个钩子。
 

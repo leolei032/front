@@ -2,8 +2,13 @@
  * 插件系统类型定义
  */
 
-// 钩子类型
-export type HookType = 'sync' | 'async' | 'waterfall' | 'bail';
+// 钩子类型（精简版 tapable）
+export type HookType =
+  | 'sync'
+  | 'asyncSeries'
+  | 'asyncParallel'
+  | 'waterfall'
+  | 'bail';
 
 // 钩子回调函数类型
 export type HookCallback<T = any, R = any> = (...args: T[]) => R;
@@ -51,7 +56,7 @@ export interface IPluginManager {
   getPlugins(): IPlugin[];
 
   // 钩子管理
-  registerHook(hookName: string, type?: HookType): this;
+  registerHook(hookName: string, type: HookType): this;
   tap<T = any, R = any>(
     hookName: string,
     callback: HookCallback<T, R>,
