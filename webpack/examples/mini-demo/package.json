@@ -1,0 +1,11 @@
+{
+  "name": "mini-demo",
+  "private": true,
+  "devDependencies": {
+    "ts-node": "^10.9.2"
+  },
+  "scripts": {
+    "build": "node -r ts-node/register/transpile-only build.js"
+  }
+}
+
