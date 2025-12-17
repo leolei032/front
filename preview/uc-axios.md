@@ -779,10 +779,177 @@ packages/
 > - **增量编译**：只构建变更的包，提升效率
 > - **独立发版**：插件独立发布，不影响核心库
 >
-> **脚手架工具**：
-> - `npm run init:plugin`：快速创建插件模板
+> **脚手架工具**（ez-snippet-cli）：
+> - 自研代码生成 CLI，基于工作流抽象和模板引擎
+> - `npm run init:plugin`：30 秒创建标准插件模板
 > - `npm run init:preset`：快速创建预设模板
-> - 自动配置构建脚本、类型定义、测试文件"
+> - 自动配置构建脚本、类型定义、测试文件
+> - 命令行交互式引导，降低上手门槛
+> - 支持动态变量注入，保证代码一致性
+
+#### 自研脚手架工具：ez-snippet-cli（加分项）
+
+**背景**：Monorepo 项目中需要频繁创建新包（插件、预设），手动创建容易出错且效率低。
+
+**解决方案**：自研了一个基于模板引擎的代码生成 CLI 工具
+
+**核心设计**：
+
+```typescript
+// 工作流配置接口
+interface WorkflowConfig {
+  input?: {
+    prompt?: PromptOptions              // 命令行交互配置
+    injectTemplateVars?: (...meta) => Record<string, unknown>  // 注入模板变量
+  }
+  output: OutputOptions | OutputOptions[]  // 输出配置
+}
+```
+
+**实现亮点**：
+
+1. **工作流（Workflow）抽象**
+```javascript
+// 使用示例：创建插件
+ezs({
+  workflowName: "plugin",
+  // 输入：命令行交互
+  input: {
+    prompt: {
+      description: "请输入插件名称",
+      initialMeta: "demo-request-interceptor"
+    },
+    // 工厂函数：将用户输入转换为模板变量
+    injectTemplateVars(meta) {
+      return {
+        pluginName: meta,
+        camelCaseName: camelCase(meta),
+        pascalCaseName: pascalCase(meta)
+      }
+    }
+  },
+  // 输出：多个文件
+  output: [
+    {
+      dirname: (meta) => `packages/plugin-${meta}`,
+      pairs: [
+        { templatePath: "template/package.json.tpl", filename: "package.json" },
+        { templatePath: "template/README.md.tpl", filename: "README.md" }
+      ]
+    },
+    {
+      dirname: (meta) => `packages/plugin-${meta}/src`,
+      pairs: [
+        { templatePath: "template/index.ts.tpl", filename: "index.ts" }
+      ]
+    }
+  ]
+})
+```
+
+2. **模板引擎集成**
+```typescript
+// 使用 lodash.template 支持动态内容
+import template from "lodash.template"
+
+function outputTemplateByPath(templatePath, outputPath, injectedVars) {
+  // 1. 读取模板文件
+  const rawTemplate = readFileSync(templatePath).toString()
+
+  // 2. 编译模板
+  const compiled = template(rawTemplate)
+
+  // 3. 注入变量，生成最终内容
+  const hydrated = compiled(injectedVars)
+
+  // 4. 写入目标文件
+  writeFileSync(outputPath, hydrated)
+}
+```
+
+**模板文件示例**：
+```typescript
+// template/index.ts.tpl
+import { defineRequestInterceptor } from "@uc/axios"
+
+export const <%= camelCaseName %> = defineRequestInterceptor(() => {
+  return {
+    onFulfilled(config) {
+      // TODO: 实现拦截逻辑
+      return config
+    }
+  }
+})
+```
+
+**生成结果**：
+```typescript
+// packages/plugin-demo-request-interceptor/src/index.ts
+import { defineRequestInterceptor } from "@uc/axios"
+
+export const demoRequestInterceptor = defineRequestInterceptor(() => {
+  return {
+    onFulfilled(config) {
+      // TODO: 实现拦截逻辑
+      return config
+    }
+  }
+})
+```
+
+3. **配置优先级机制**
+```typescript
+// 支持多种配置方式
+// 1. Node.js API 调用（最高优先级）
+import ezs from "@uc/ez-snippet-cli"
+ezs({ workflowName: "plugin", ... })
+
+// 2. 命令行参数
+ezs plugin --config=custom.config.js
+
+// 3. 默认配置文件
+// ezs.config.js 或 ezs.config.json
+```
+
+4. **命令行交互（用户体验优化）**
+```typescript
+import enquirer from "enquirer"
+
+async function getMetaByPrompt(promptOptions) {
+  const response = await prompt({
+    type: "input",
+    name: "meta",
+    message: promptOptions.description,
+    initial: promptOptions.initialMeta,
+    required: true
+  })
+  return response.meta
+}
+```
+
+**实际效果**：
+```bash
+$ npm run init:plugin
+
+----------欢迎使用 @uc/ez-snippet-cli----------
+[@uc/ez-snippet-cli-log]: 读取配置成功
+✔ 请输入插件名称 · retry-request-interceptor
+
+[@uc/ez-snippet-cli-log]: /packages/plugin-retry-request-interceptor: 开始创建模版目录...
+[@uc/ez-snippet-cli-info]: 模版创建成功：package.json
+[@uc/ez-snippet-cli-info]: 模版创建成功：vite.config.ts
+[@uc/ez-snippet-cli-info]: 模版创建成功：src/index.ts
+[@uc/ez-snippet-cli-success]: 所有模版编译完成！
+```
+
+**技术价值**：
+- **提升效率**：创建新插件从 30 分钟降至 30 秒
+- **减少错误**：模板保证文件结构和配置一致性
+- **降低门槛**：新成员无需记忆复杂的配置，跟随交互提示即可
+- **可复用**：工具已开源，其他 Monorepo 项目可直接使用
+
+**面试话术**：
+> "为了提升 Monorepo 项目的开发效率，我设计并实现了 ez-snippet-cli 脚手架工具。它基于**工作流抽象 + 模板引擎**，支持命令行交互式创建代码。核心亮点是将复杂的文件生成流程抽象为 input（输入元数据）→ transform（转换变量）→ output（生成文件）三个阶段，结合 lodash.template 实现动态内容注入。这个工具让创建新插件的时间从 30 分钟降至 30 秒，同时保证了代码结构的一致性。"
 
 ---
 
@@ -969,6 +1136,47 @@ packages/
 
 ---
 
+### Q7: 你自研的脚手架工具是如何设计的？
+
+**回答**：
+> "ez-snippet-cli 是我为 Monorepo 项目设计的代码生成工具，核心设计理念是**工作流抽象**：
+>
+> **架构设计**：
+> ```
+> 命令行输入 → 配置解析 → 工作流匹配 → 用户交互 → 变量注入 → 模板编译 → 文件生成
+> ```
+>
+> **关键技术点**：
+>
+> 1. **工作流抽象**：
+>    - 将代码生成流程抽象为 `input`（输入）→ `transform`（转换）→ `output`（输出）三个阶段
+>    - 每个工作流独立配置，互不干扰
+>
+> 2. **配置优先级**：
+>    - Node.js API > 命令行参数 > 配置文件
+>    - 支持 JS 和 JSON 两种配置格式
+>
+> 3. **模板引擎选型**：
+>    - 使用 lodash.template，轻量且功能强大
+>    - 支持插值 `<%= %>` 和执行 `<% %>` 两种语法
+>
+> 4. **用户体验优化**：
+>    - 使用 enquirer 实现命令行交互
+>    - 彩色日志输出（chalk），清晰直观
+>    - 错误提示友好，引导用户修正
+>
+> **设计亮点**：
+> - **函数式配置**：dirname 和 filename 支持函数形式，根据用户输入动态生成
+> - **批量生成**：output 支持数组，一次工作流生成多个目录的文件
+> - **类型安全**：完整的 TypeScript 类型定义，IDE 智能提示
+>
+> **实际收益**：
+> - 创建新插件时间从 30 分钟降至 30 秒
+> - 保证 28 个子包的目录结构一致性
+> - 新成员上手成本降低 70%"
+
+---
+
 ## 📚 延伸学习方向
 
 ### 如果面试官深挖，可以聊的话题：
@@ -992,11 +1200,18 @@ packages/
    - Monorepo vs Multirepo
    - 包版本管理策略
    - 依赖提升（Hoisting）问题
+   - 脚手架工具设计（模板引擎、AST 转换、代码生成）
 
 5. **安全性**：
    - XSS、CSRF、中间人攻击
    - 前端加密的局限性
    - 安全传输协议（TLS）
+
+6. **CLI 工具开发**：
+   - 命令行交互库选型（inquirer vs enquirer）
+   - 模板引擎原理（lodash.template vs handlebars）
+   - Node.js 文件系统操作最佳实践
+   - 配置文件加载机制（cosmiconfig）
 
 ---
 
@@ -1008,7 +1223,8 @@ packages/
 - **设计模式**：综合运用多种模式解决实际问题
 - **性能优化**：运行时 + 构建时多维度优化
 - **安全机制**：端到端加密 + 请求签名 + Token 管理
-- **工程化**：Monorepo + Turbo + TypeScript
+- **工程化**：Monorepo + Turbo + TypeScript + 自研脚手架
+- **开发体验**：命令行交互式代码生成，30 秒创建标准插件
 - **业务价值**：提升开发效率、统一安全策略、降低维护成本
 
 **面试建议**：
