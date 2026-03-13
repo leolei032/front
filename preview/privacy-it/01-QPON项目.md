@@ -98,7 +98,7 @@
 | 方案 | 优点 | 缺点 | 不选的原因 |
 |------|------|------|-----------|
 | Skeleton | 实现简单 | 无真实内容，感知体验一般 | 低端机上 JS 加载完成前等待太久 |
-| SSR | 首屏有内容 | 服务端成本高，低端机 hydrate 慢 | hydrate 在低端机上反而是瓶颈 |
+| SSR | 首屏有内容 | 需要服务端 | 我们用 Capacitor.js 打包，本地 WebView 加载，没有服务端，SSR 架构上不可行 |
 | 预渲染 | 静态快，SEO 好 | 动态数据无法覆盖 | 首页内容依赖用户位置等动态数据 |
 | iframe 快照 | 瞬间展示，像素级还原 | 实现复杂，数据非实时 | **选中方案** |
 
@@ -110,34 +110,73 @@
 
 **Action**：
 
-**1. 快照生成（服务端）**
+核心思路：**用一个纯静态的轻量 iframe 页面做"快照"，数据来自 localStorage 缓存，不依赖任何网络请求，实现瞬开。**
+
+**1. 缓存数据更新**
 ```javascript
-// 使用Puppeteer渲染首页
-const browser = await puppeteer.launch();
-const page = await browser.newPage();
-await page.goto('https://qpon.com/home');
-await page.waitForSelector('.poi-card');
-
-// 提取HTML + 内联CSS
-const html = await page.evaluate(() => {
-  const styles = Array.from(document.styleSheets)
-    .map(sheet => Array.from(sheet.cssRules).map(rule => rule.cssText).join(''))
-    .join('');
-  return `<style>${styles}</style>` + document.body.innerHTML;
-});
-
-// 存储到CDN
-await uploadToCDN('snapshot.html', html);
+// 每次真实首页接口返回后，将关键数据写入 localStorage
+const homeData = await fetchHomeData();
+localStorage.setItem('HOME_SNAPSHOT_DATA', JSON.stringify({
+  banners: homeData.banners,
+  couponList: homeData.couponList,
+  timestamp: Date.now()
+}));
 ```
 
-**2. 快照注入（客户端）**
+**2. 手写轻量快照页面 + 简易模板引擎**
+
+手写纯 HTML/CSS 页面，不引入任何框架。同时自己实现了一套**最简模板语法**，支持变量插值、条件判断和循环，用于将 localStorage 缓存数据渲染到快照 HTML 中。
+
+```html
+<!-- snapshot.html — 纯静态模板，构建时注入到主页面的 iframe 中 -->
+<html>
+<head>
+  <style>
+    /* 手写简单布局样式，只还原首屏视觉结构 */
+    .banner { width: 100%; height: 150px; }
+    .coupon-item { display: flex; padding: 12px; border-bottom: 1px solid #eee; }
+    .coupon-item img { width: 60px; height: 60px; border-radius: 8px; }
+    .coupon-info { margin-left: 12px; }
+  </style>
+</head>
+<body>
+  <!-- 模板语法：变量插值、条件、循环 -->
+  {{if banners.length}}
+    <img class="banner" src="{{banners[0].url}}" />
+  {{/if}}
+
+  {{each couponList as item}}
+    <div class="coupon-item">
+      <img src="{{item.image}}" />
+      <div class="coupon-info">
+        <div>{{item.title}}</div>
+        <div>{{item.discount}}</div>
+      </div>
+    </div>
+  {{/each}}
+
+  <script>
+    // 从 localStorage 读取缓存数据
+    const data = JSON.parse(localStorage.getItem('HOME_SNAPSHOT_DATA') || '{}');
+    // 模板引擎：解析 {{变量}}、{{if}}、{{each}} 语法，替换为实际数据后写入 DOM
+    render(document.body, data);
+  </script>
+</body>
+</html>
+```
+
+**为什么自己写模板引擎而不用模板字符串拼接？**
+- 模板和数据分离，HTML 结构更清晰，非开发人员也能调整布局
+- 循环和条件让模板有最小的动态能力，覆盖列表渲染场景
+- 实现极轻量（几十行代码），不引入任何依赖，保持快照页体积极小
+
+**3. iframe 注入 + 无缝切换**
 ```javascript
-// 主页面加载时立即注入快照iframe
+// 主页面加载时立即展示快照 iframe（纯本地渲染，无网络请求）
 <iframe
   id="snapshot-iframe"
-  src="https://cdn.qpon.com/snapshot.html"
-  style="width:100%;height:100%;border:none"
-  sandbox="allow-same-origin"
+  src="snapshot.html"
+  style="width:100%;height:100%;border:none;pointer-events:none"
 />
 
 // 同时在后台加载真实页面
@@ -146,35 +185,33 @@ await uploadToCDN('snapshot.html', html);
 </div>
 ```
 
-**3. 无缝切换**
 ```javascript
+// 真实页面就绪后切换
 useEffect(() => {
   if (isRealPageReady) {
-    gsap.to('#snapshot-iframe', { opacity: 0, duration: 0.3 });
-    gsap.to('#real-page', { opacity: 1, duration: 0.3, display: 'block' });
-    setTimeout(() => {
-      document.getElementById('snapshot-iframe').remove();
-    }, 300);
+    document.getElementById('real-page').style.display = 'block';
+    document.getElementById('snapshot-iframe')?.remove();
   }
 }, [isRealPageReady]);
 ```
 
-**4. 像素级还原关键技术**
-- CSS内联：将所有外部CSS内联到快照HTML
-- 字体预加载：快照中使用Base64编码的关键字体
-- 图片占位：关键图片使用低质量占位图（LQIP）
-- 禁用交互：iframe设置 `pointer-events: none`
+**为什么快？**
+- 手写 HTML/CSS，**没有框架、没有打包产物**，体积极小
+- 数据来自 localStorage，**零网络请求**
+- 不含任何交互逻辑，**纯展示，JS 执行量极低**
+- 低端机上瓶颈是 JS 解析执行，这个方案直接绕开了
 
-**5. 数据新鲜度**
-- 快照每小时更新一次（非实时数据）
-- 适用场景：首页/分类页（数据变化不频繁）
-- 不适用：用户个人页（需要实时数据）
+**局限性（主动说）**
+- 首次访问没有缓存数据，快照为空，走正常加载流程
+- 数据是上一次访问时缓存的，可能有滞后（但快照只展示 0.5-1 秒就被替换）
+- 只适用于首页等结构稳定的页面，不适用于动态个人页
 
 **Result**：低端机完整首屏从 3.5s 降到 1.5s（提升57%）。用户投诉量下降40%，低端机用户次日留存率提升15%。
 
 **追问应对**：
-- **快照数据过期怎么办？** 快照只展示0.5-1秒，过期数据影响很小。真实页面加载后立即替换。
-- **iframe安全风险？** 使用 `sandbox="allow-same-origin"` 限制权限，快照HTML由我们自己生成，可控。
+- **首次访问没缓存怎么办？** 降级走正常加载流程，快照是增量优化，不影响基线体验。
+- **快照数据过期怎么办？** 快照只展示 0.5-1 秒就被真实页面替换，用户几乎感知不到数据差异。
+- **为什么不用 SSR？** 我们用 Capacitor.js 打包，页面是本地 HTML 运行在 WebView 里，没有传统意义上的服务端，SSR 在架构上就不可行。即使引入 SSR 也需要额外搭建服务端，且低端机上 hydrate 本身也是瓶颈。
 
 ---
 
@@ -190,43 +227,68 @@ useEffect(() => {
 -> "有人绕过卡点强行合并怎么办？"
 ```
 
-### 标准回答
+### 标准回答（STAR）
 
-**四层防护控制 CI 环境波动：**
+**Situation**：团队扩张后性能劣化频繁，缺乏系统化的性能守护机制，上线后才发现问题。
 
-**1. 网络环境标准化**
+**Task**：搭建自动化性能卡点系统，集成到 CI/CD 流水线，在 MR 阶段拦截性能劣化。
+
+**Action**：
+
+**整体架构：三层分离**
+- **Controller 层**：RESTful API 接口，接收评测请求、返回报告文件
+- **Service 层**：核心业务逻辑——历史数据管理、评分验证、报告上传
+- **Process 层**：独立进程执行 Lighthouse 任务（Playwright 启动 Chromium + Lighthouse 评测）
+
+**1. 评测执行：独立进程 + Playwright**
 ```javascript
-// Lighthouse 模拟3G网络（固定条件，不依赖真实网络）
-lighthouse(url, {
-  throttling: {
-    requestLatencyMs: 150,
-    downloadThroughputKbps: 1600,
-    uploadThroughputKbps: 750,
-  },
-  throttlingMethod: 'simulate',
+// 每次评测启动独立 Chromium 实例，随机调试端口支持并发
+const browserServer = await chromium.launchServer({
+  headless: true,
+  args: [`--remote-debugging-port=${randomPort}`, '--incognito']
 });
+
+const options = {
+  port: randomPort,
+  output: 'html',
+  onlyCategories: ['performance'],
+  onlyAudits: ['first-contentful-paint', 'largest-contentful-paint',
+               'total-blocking-time', 'cumulative-layout-shift', 'speed-index'],
+  throttling: throttlingOptions,    // 支持 3G/4G 等多种网络模拟
+  emulatedFormFactor: device,       // mobile/desktop
+};
+
+const runnerResult = await lighthouse(url, options);
 ```
 
-**2. 多次测试取中位数**
-```javascript
-const scores = [];
-for (let i = 0; i < 3; i++) {
-  const result = await runLighthouse(url);
-  scores.push(result.performance);
-}
-const medianScore = scores.sort()[1]; // 取中位数
+通过进程池管理 Lighthouse 任务，父子进程通信（`process.send` / `process.on('message')`），避免主进程阻塞，设置 55 秒超时防止任务挂起。
+
+**2. 评分验证：四维对比 + 动态容差**
+
+不是简单的"分数低于阈值就拦截"，而是多维度对比：
+
+```
+验证规则：
+  1. 必须满足：新评分 >= 基准分数（从配置中心动态获取）
+  2. 至少满足一项历史对比（带容差）：
+     - 新评分 > 上次评分 - 容差
+     - 新评分 > 前5次中位数 - 容差
+     - 新评分 > 前5次平均数 - 容差
 ```
 
-**3. 缓存预热**
-- 第一次访问：预热CDN和ISR缓存
-- 第二次访问：正式测试（排除冷启动）
+**容差根据网络条件动态调整**（网络越差波动越大，容差越宽）：
+- 3G 网络：5 分容差
+- 慢速 4G：10 分容差
+- 桌面 4G：15 分容差
 
-**4. 合理阈值**
-- 性能>70，SEO>90，无障碍>85
-- 连续3次低于阈值才告警
-- 允许特殊情况skip（需说明理由）
+**为什么用中位数+平均数+上次三重对比？** 单看上次分数，一次异常就会拉低基线导致后续全部通过；只看平均数会被极端值拉偏；中位数最稳定但不够敏感。三项至少满足一项，既防止误报，又能捕捉真实劣化。
 
-**效果**：性能分波动从±15分降到±5分，误报率<5%，95%的MR顺利通过。
+**3. 数据管理与报告**
+- 每次评测生成唯一 pageId（`pageName_env_device_throttling`），存储历史评分到数据库
+- HTML 报告上传到 OCS，支持在线查看，MR 评论中附带报告链接
+- 保留完整历史数据，支持趋势分析
+
+**Result**：性能分波动从±15分降到±5分，误报率<5%，95%的MR顺利通过。上线后性能劣化问题减少80%。
 
 ---
 
