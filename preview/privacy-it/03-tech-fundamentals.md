@@ -1,0 +1,1414 @@
+# 技术原理速查手册
+
+> 原则：不死磕八股，用项目场景带出原理
+
+---
+
+## 一、React 深度
+
+### 1.1 Fiber 架构与调度（关联：QPON 性能优化）
+
+**背景问题**
+
+React 15 的 Stack Reconciler 是递归同步执行的：
+
+- 一旦开始 diff，必须一次性完成整棵树
+- 大组件树更新时，主线程被阻塞，可能超过 16ms（掉帧）
+- 用户交互（点击、输入）得不到响应
+
+**Fiber 解决方案**
+
+Fiber 是 React 16 引入的新架构，核心思想是**可中断的异步渲染**：
+
+| 特性     | Stack Reconciler | Fiber Reconciler |
+| -------- | ---------------- | ---------------- |
+| 执行方式 | 递归，同步       | 链表，可中断     |
+| 数据结构 | 函数调用栈       | Fiber 节点链表   |
+| 优先级   | 无               | 有（lane 模型）  |
+| 中断恢复 | 不支持           | 支持             |
+
+**核心变化有三个**：
+
+**1. 数据结构改变**
+
+- 每个组件对应一个 Fiber 节点
+- Fiber 节点通过 `child`、`sibling`、`return` 形成链表
+- 遍历方式从递归变成循环，可以随时中断保存进度
+
+**2. 两阶段渲染**
+
+- **Render 阶段**（可中断）：构建 Fiber 树，计算 diff，标记变更
+- **Commit 阶段**（不可中断）：把变更应用到 DOM
+
+**3. 优先级调度**
+
+- 用户交互（点击）> 动画 > 数据更新
+- 高优先级任务可以打断低优先级任务
+- 通过 `requestIdleCallback`（现在用 Scheduler）调度
+
+**实际效果**：大列表更新时，用户点击按钮能立即响应，不会有卡顿感。
+
+**Fiber 节点结构**
+
+```javascript
+{
+  // 静态结构
+  tag: 1,              // 组件类型（函数组件、类组件、原生DOM等）
+  type: 'div',         // 元素类型
+  key: null,
+
+  // 链表结构
+  child: Fiber,        // 第一个子节点
+  sibling: Fiber,      // 下一个兄弟节点
+  return: Fiber,       // 父节点
+
+  // 状态
+  memoizedState: {},   // Hooks 链表（函数组件）
+  memoizedProps: {},   // 上次渲染的 props
+
+  // 副作用
+  flags: Update,       // 需要执行的操作（插入/更新/删除）
+  nextEffect: Fiber,   // 下一个有副作用的节点
+}
+```
+
+**时间切片实现**
+
+React 把渲染工作拆成小单元（每个 Fiber 节点），用 `shouldYield()` 检查是否要让出主线程：
+
+```javascript
+function workLoop() {
+  while (workInProgress !== null && !shouldYield()) {
+    workInProgress = performUnitOfWork(workInProgress);
+  }
+}
+```
+
+`shouldYield()` 检查当前帧是否还有剩余时间（默认 5ms），没有就暂停，把控制权还给浏览器处理用户交互，下一帧继续。
+
+---
+
+### 1.2 Hooks 实现原理
+
+**核心原理**
+
+Hooks 本质是**链表**，挂在 Fiber 节点的 `memoizedState` 上：
+
+```javascript
+// 组件内部调用
+const [count, setCount] = useState(0);
+const [name, setName] = useState('');
+
+// Fiber 节点内部结构
+fiber.memoizedState = {
+  memoizedState: 0, // useState(0) 的值
+  next: {
+    memoizedState: '', // useState('') 的值
+    next: null,
+  },
+};
+```
+
+**链表 + 顺序依赖**：
+
+- **Mount 阶段**（首次渲染）：每调用一个 Hook，创建一个 Hook 节点，按调用顺序串成链表，挂在 Fiber 的 `memoizedState` 上
+- **Update 阶段**（更新渲染）：按**同样的顺序**遍历链表，取出对应位置的状态
+
+**为什么不能在条件语句中用？**
+
+```javascript
+// -- 错误示例 --
+if (condition) {
+  const [a, setA] = useState(1); // 条件为 false 时不执行
+}
+const [b, setB] = useState(2);
+
+// 第一次渲染：链表是 [a, b]
+// 第二次渲染（condition=false）：代码只调用了一个 useState
+// React 按顺序取第一个节点，但期望的是 b，导致错乱
+```
+
+铁律：**每次渲染，Hooks 的调用顺序必须完全一致**。
+
+**useState vs useReducer**
+
+底层实现几乎一样，useState 就是 useReducer 的语法糖：
+
+```javascript
+// useState 内部实现
+function useState(initialState) {
+  return useReducer(
+    (state, action) => (typeof action === 'function' ? action(state) : action),
+    initialState
+  );
+}
+```
+
+选择原则：
+
+- 简单状态用 `useState`
+- 复杂状态逻辑（多个子值、依赖前一个状态）用 `useReducer`
+
+**useEffect vs useLayoutEffect**
+
+| Hook              | 执行时机                             | 是否阻塞渲染 | 适用场景               |
+| ----------------- | ------------------------------------ | ------------ | ---------------------- |
+| `useEffect`       | DOM 更新后，浏览器绘制**后**异步执行 | 否           | 数据获取、订阅、日志   |
+| `useLayoutEffect` | DOM 更新后，浏览器绘制**前**同步执行 | 是           | 测量 DOM、同步修改样式 |
+
+99% 的场景用 `useEffect`。只有需要**读取 DOM 布局**并**同步修改**时用 `useLayoutEffect`（如 Tooltip 定位、测量元素尺寸后调整位置）：
+
+```javascript
+// 场景：根据内容高度决定展开/收起
+useLayoutEffect(() => {
+  const height = ref.current.scrollHeight;
+  if (height > 100) {
+    setShowMore(true); // 同步设置，避免闪烁
+  }
+}, [content]);
+```
+
+【项目关联】QPON 的瀑布流布局中用 useLayoutEffect 测量卡片高度后重新排列，避免先看到错位再跳到正确位置。
+
+**useMemo vs useCallback**
+
+| Hook          | 缓存的是     | 返回值 |
+| ------------- | ------------ | ------ |
+| `useMemo`     | **计算结果** | 任意值 |
+| `useCallback` | **函数引用** | 函数   |
+
+```javascript
+// useMemo：缓存计算结果
+const expensiveValue = useMemo(() => computeExpensive(a, b), [a, b]);
+
+// useCallback：缓存函数引用
+const handleClick = useCallback(() => {
+  doSomething(a, b);
+}, [a, b]);
+
+// useCallback 等价于
+const handleClick = useMemo(
+  () => () => {
+    doSomething(a, b);
+  },
+  [a, b]
+);
+```
+
+**React.memo vs useMemo**：完全不同的东西。`React.memo` 是高阶组件，对组件的 props 做浅比较；`useMemo` 是 Hook，缓存组件内部的计算结果。
+
+**useEffect 清理函数执行时机**：
+
+1. 组件卸载时
+2. 下一次 effect 执行前（依赖变化时）
+
+```javascript
+useEffect(() => {
+  console.log('effect', count);
+  return () => console.log('cleanup', count);
+}, [count]);
+
+// count: 0 -> 1 时
+// 输出：cleanup 0 -> effect 1
+```
+
+---
+
+### 1.3 Virtual DOM & Diff 算法
+
+Virtual DOM 是用 **JS 对象描述 DOM 结构**，Diff 算法比较新旧两棵树找出变化。
+
+**为什么要 Virtual DOM？**
+
+- 直接操作 DOM 很慢（触发重排重绘）
+- 批量计算变化，最小化 DOM 操作
+
+**Diff 算法的三个假设（优化策略）**：
+
+**1. 同层比较**
+
+- 只比较同一层级的节点
+- 跨层级移动视为删除 + 新建
+- 复杂度从 O(n^3) 降到 O(n)
+
+**2. 类型不同直接替换**
+
+- `<div>` 变成 `<span>`，直接销毁重建
+- 不会尝试复用子节点
+
+**3. key 标识节点**
+
+- 列表渲染时，用 key 识别节点身份
+- 没有 key 就按顺序比较（容易出错）
+
+**Diff 过程（简化）**：
+
+```javascript
+function diff(oldNode, newNode) {
+  // 1. 类型不同，直接替换
+  if (oldNode.type !== newNode.type) {
+    return { type: 'REPLACE', node: newNode };
+  }
+
+  // 2. 都是文本节点，比较内容
+  if (typeof newNode === 'string') {
+    return oldNode !== newNode ? { type: 'TEXT', text: newNode } : null;
+  }
+
+  // 3. 同类型元素，比较 props
+  const propsDiff = diffProps(oldNode.props, newNode.props);
+
+  // 4. 递归比较子节点
+  const childrenDiff = diffChildren(oldNode.children, newNode.children);
+
+  return { propsDiff, childrenDiff };
+}
+```
+
+**为什么不建议用 index 作为 key？**
+
+```javascript
+// 原列表：[A, B, C]，key 是 [0, 1, 2]
+// 删除 A 后：[B, C]，key 变成 [0, 1]
+
+// React 比较：
+// key=0: A -> B（props 变了，更新）
+// key=1: B -> C（props 变了，更新）
+// key=2: C -> 无（删除）
+
+// 实际上只删了 A，但 React 更新了 B 和 C，还删除了 C
+```
+
+应该用后端返回的唯一 ID；如果没有 ID，用内容生成稳定的 hash；只有**纯展示、不会增删**的列表才能用 index。
+
+---
+
+### 1.4 并发特性 (React 18)
+
+Concurrent Mode 是 React 18 正式发布的**并发渲染能力**，让渲染可以被中断和恢复。
+
+**1. startTransition**
+
+标记低优先级更新，不阻塞用户输入：
+
+```javascript
+import { startTransition } from 'react';
+
+function handleSearch(input) {
+  // 高优先级：立即更新输入框
+  setInput(input);
+
+  // 低优先级：搜索结果可以延后
+  startTransition(() => {
+    setSearchResults(search(input));
+  });
+}
+```
+
+**2. useDeferredValue**
+
+延迟更新某个值，类似防抖但更智能：
+
+```javascript
+const deferredQuery = useDeferredValue(query);
+// query 立即更新，deferredQuery 延迟更新
+// 当 query 和 deferredQuery 不同时，可以显示 loading
+```
+
+**3. Suspense 增强**
+
+- 配合 Server Components 实现流式渲染
+- 数据获取时显示 fallback
+
+【项目关联】AI 平台的搜索输入框用 `startTransition` 包裹搜索请求，用户快速输入时，搜索结果延后渲染，输入框保持流畅。QPON 搜索输入框用 `useDeferredValue`，输入时不卡顿。
+
+---
+
+### 1.5 闭包陷阱
+
+**经典场景**
+
+```javascript
+function Counter() {
+  const [count, setCount] = useState(0);
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      console.log(count); // 永远是 0
+      setCount(count + 1); // 永远设置成 1
+    }, 1000);
+    return () => clearInterval(timer);
+  }, []); // 依赖数组为空
+
+  return <div>{count}</div>;
+}
+```
+
+**原因**：`useEffect` 的回调在 mount 时创建，捕获了当时的 `count`（0）。依赖数组是 `[]`，不会重新创建回调，定时器里的 `count` 永远是初始值。
+
+**解决方案**：
+
+**方案1：函数式更新**（优先推荐）
+
+```javascript
+setCount((prev) => prev + 1); // 不依赖外部 count
+```
+
+**方案2：添加依赖**
+
+```javascript
+useEffect(() => {
+  const timer = setInterval(() => {
+    setCount(count + 1);
+  }, 1000);
+  return () => clearInterval(timer);
+}, [count]); // count 变化时重新创建定时器
+```
+
+**方案3：useRef 存最新值**
+
+```javascript
+const countRef = useRef(count);
+countRef.current = count; // 每次渲染更新 ref
+
+useEffect(() => {
+  const timer = setInterval(() => {
+    setCount(countRef.current + 1);
+  }, 1000);
+  return () => clearInterval(timer);
+}, []);
+```
+
+原则：优先用**函数式更新**，最简单；需要读取最新值但不想重建回调，用 **useRef**。
+
+---
+
+### 1.6 性能优化手段
+
+【项目关联】QPON 性能优化、AI 平台首屏优化
+
+**1. 减少不必要的渲染**
+
+- `React.memo` 包裹纯展示组件
+- `useMemo` 缓存复杂计算
+- `useCallback` 稳定回调引用
+
+**2. 减少渲染量**
+
+- **虚拟列表**：长列表只渲染可视区域（react-window）
+- **懒加载**：`React.lazy` + `Suspense` 按需加载组件
+- **分页/无限滚动**：不要一次渲染太多数据
+
+**3. 优化 Context**
+
+- 拆分 Context，避免无关组件重渲染
+- 用 `useMemo` 包裹 Provider 的 value
+
+```javascript
+// -- 每次渲染都创建新对象 --
+<Context.Provider value={{ user, setUser }}>
+
+// -- 稳定引用 --
+const value = useMemo(() => ({ user, setUser }), [user]);
+<Context.Provider value={value}>
+```
+
+**4. 代码层面**
+
+- 避免在 render 中创建新对象/函数
+- 列表 key 使用稳定 ID
+- 避免过深的组件嵌套
+
+**不要滥用 memo/useMemo/useCallback 的原因**：本身有开销（创建闭包、比较依赖），简单计算直接算比缓存快。原则：**先写正常代码，遇到性能问题再优化**。
+
+【项目关联】QPON 首页有 200+ 个 POI 卡片，用 `react-window` 虚拟化后，渲染时间从 800ms 降到 50ms。
+
+---
+
+### 1.7 状态管理方案对比
+
+| 方案                        | 适用场景             | 复杂度 |
+| --------------------------- | -------------------- | ------ |
+| `useState` + `useContext`   | 简单全局状态         | 低     |
+| `useReducer` + `useContext` | 复杂状态逻辑         | 中     |
+| **Zustand**                 | 中型应用，简洁       | 低     |
+| **Redux Toolkit**           | 大型应用，需要中间件 | 中高   |
+| **Jotai/Recoil**            | 细粒度原子状态       | 中     |
+
+```javascript
+// Zustand 示例
+const useStore = create((set) => ({
+  count: 0,
+  increment: () => set((state) => ({ count: state.count + 1 })),
+}));
+
+// 使用
+function Counter() {
+  const { count, increment } = useStore();
+  return <button onClick={increment}>{count}</button>;
+}
+```
+
+**Zustand 的优势**：不需要 Provider 包裹；支持 selector 细粒度订阅；体积小（1KB），学习成本低。
+
+【项目关联】QPON 使用 Zustand 做客户端缓存（如推荐文章多页缓存）；AI 平台同样使用 Zustand。
+
+---
+
+## 二、Next.js 深度
+
+### 2.1 App Router vs Pages Router（关联：AI 平台）
+
+| 特性         | Pages Router                            | App Router                |
+| ------------ | --------------------------------------- | ------------------------- |
+| 路由定义     | `pages/` 目录，文件即路由               | `app/` 目录，文件夹即路由 |
+| 默认组件类型 | Client Components                       | **Server Components**     |
+| 数据获取     | `getServerSideProps` / `getStaticProps` | 直接 `async/await` fetch  |
+| 布局         | 需要 `_app.js` 包裹                     | 原生 `layout.js` 嵌套布局 |
+| Loading 状态 | 手动实现                                | 原生 `loading.js`         |
+| 错误处理     | 手动实现                                | 原生 `error.js`           |
+| 流式渲染     | 不支持                                  | 原生支持 Streaming        |
+
+**选择 App Router 的三个原因**：
+
+1. **Server Components 默认支持**。AI 内容平台有大量静态内容（文章详情、分类列表），用 RSC 可以在服务端渲染，减少客户端 JS 体积，首屏更快。
+2. **嵌套布局更优雅**。项目有多层布局（根布局 -> 语言布局 -> 页面布局），App Router 的 `layout.js` 天然支持。
+3. **数据获取更直观**。直接在组件里 `async/await` 获取数据，配合 `revalidate` 实现 ISR。
+
+**迁移注意**：`useRouter` 要从 `next/navigation` 导入；很多第三方库还不支持 RSC，需要加 `'use client'`；数据获取方式完全不同，需要重构。
+
+---
+
+### 2.2 ISR / SSR / SSG
+
+| 渲染方式 | 全称                            | 渲染时机          | 适用场景                 |
+| -------- | ------------------------------- | ----------------- | ------------------------ |
+| **SSG**  | Static Site Generation          | 构建时            | 纯静态内容，博客、文档   |
+| **SSR**  | Server-Side Rendering           | 每次请求          | 实时数据，用户个性化内容 |
+| **ISR**  | Incremental Static Regeneration | 构建时 + 按需更新 | 内容较稳定但需要更新     |
+
+【项目关联】AI 内容平台采用 **ISR 为主 + SSR 为辅** 的混合策略。
+
+**ISR 用于内容页面**（首页、分类页、文章详情页）：
+
+- 文章内容更新频率低（每天几篇），不需要实时
+- 设置 `revalidate: 3600`（1小时），平衡新鲜度和性能
+- 首次访问后缓存，后续访问直接返回静态页面，P95 延迟 146ms
+
+**SSR 用于 AI 搜索接口**：
+
+- 用户输入实时变化，无法预测
+- 需要调用 LLM，必须服务端处理
+- 用流式响应（Streaming）优化体验
+
+**为什么不用纯 SSG？** 1200+ 篇文章 x 3 种语言 = 3600+ 页面，全量构建太慢，且文章会更新，ISR 的按需生成更适合。
+
+```typescript
+// app/[lang]/[city]/[slug]/page.tsx
+export const revalidate = 3600; // ISR: 1小时重新验证
+
+export async function generateStaticParams() {
+  // 构建时预生成热门页面
+  const hotArticles = await getHotArticles(100);
+  return hotArticles.map(article => ({
+    lang: article.lang,
+    city: article.city,
+    slug: article.slug,
+  }));
+}
+
+export default async function ArticlePage({ params }) {
+  const article = await getArticle(params.slug);
+  return <ArticleDetail article={article} />;
+}
+```
+
+**ISR 缓存失效机制**：
+
+1. **时间失效（revalidate）**：设置 `revalidate: 3600`，1小时后下一次请求触发后台重新生成，用户看到的还是旧页面（stale-while-revalidate）
+2. **按需失效（On-Demand Revalidation）**：调用 `revalidatePath('/article/xxx')` 或 `revalidateTag('articles')`
+
+项目用的是**组合策略**：时间失效兜底 + 手动失效保证关键更新及时生效。
+
+---
+
+### 2.3 Server Components vs Client Components
+
+| 特性      | Server Components          | Client Components               |
+| --------- | -------------------------- | ------------------------------- |
+| 渲染位置  | 服务端                     | 客户端（浏览器）                |
+| JS Bundle | **不包含**                 | 包含在 bundle 中                |
+| 可以使用  | 数据库、文件系统、敏感 API | useState、useEffect、浏览器 API |
+| 不能使用  | Hooks、浏览器事件          | 直接访问服务端资源              |
+| 标记方式  | 默认（App Router）         | `'use client'`                  |
+
+核心价值是**减少客户端 JS 体积**。原则：**能用 Server Component 就用 Server Component**，只有需要交互的组件才标记 `'use client'`。
+
+【项目关联】AI 平台文章详情页是 Server Component（直接查数据库渲染 HTML，0 KB JS）；AI 搜索输入框是 Client Component（需要 useState）；地图组件是 Client Component（Mapbox GL 必须在浏览器运行）。首页 JS bundle 从 180KB 降到 90KB。
+
+**Composition Pattern（Server + Client 配合）**：
+
+```tsx
+// -- 错误：Server Component 不能直接用在 Client Component 内部 --
+'use client';
+function ClientWrapper() {
+  return <ServerComponent />; // 报错
+}
+
+// -- 正确：通过 children 传递 --
+('use client');
+function ClientWrapper({ children }) {
+  const [open, setOpen] = useState(false);
+  return <div onClick={() => setOpen(!open)}>{children}</div>;
+}
+
+// 在 Server Component 中组合
+function Page() {
+  return (
+    <ClientWrapper>
+      <ServerComponent /> {/* 作为 children 传入 */}
+    </ClientWrapper>
+  );
+}
+```
+
+ServerComponent 仍然在服务端渲染，只有 ClientWrapper 的交互逻辑在客户端。
+
+---
+
+### 2.4 Next.js 框架内部四层缓存机制
+
+> 注意：这是 **Next.js 框架自带的四层缓存**，不是你项目的基础设施四级缓存（SW → CDN → ISR → Redis）。项目的缓存架构见 `01-qa-ai-platform.md` Part 3。这四层是 Next.js 源站内部的实现细节。
+
+| 缓存层                  | 位置               | 缓存什么 | 生命周期 | 失效方式 |
+| ----------------------- | ------------------ | -------- | -------- | -------- |
+| **Request Memoization** | 服务端（单次渲染） | fetch 调用去重 | 一次渲染结束自动清除 | 自动 |
+| **Data Cache**          | 服务端（跨请求）   | fetch 的 JSON 结果 | 由 `revalidate` 控制 | `revalidate` / `revalidateTag` |
+| **Full Route Cache**    | 服务端（跨请求）   | 渲染好的 HTML + RSC Payload | 由 `revalidate` 控制 | `revalidatePath` |
+| **Router Cache**        | 客户端（浏览器）   | 访问过的路由页面 | 静态 5min / 动态 30s | 刷新页面 |
+
+**逐层详解**：
+
+**第 1 层：Request Memoization（单次渲染内去重）**
+
+同一次页面渲染中，多个 Server Components fetch 同一个 URL，只实际请求一次：
+
+```tsx
+// Header、Sidebar、Content 三个 Server Components 都需要用户数据
+const user = await fetch('/api/user'); // 实际只发 1 次请求
+// 另外两个组件的同 URL fetch 直接复用第一次的结果
+```
+
+完全自动，不需要配置。渲染结束后清除，下一个用户请求重新开始。
+
+**生效条件**：仅限 Server Components + 原生 `fetch` + GET 请求。客户端用 axios/SWR 发的请求完全不受此影响（前两层 Request Memoization 和 Data Cache 同理）。项目中客户端请求用的是 `@/lib/client/http`（axios 单例），走独立路径：浏览器 → API Route → Redis → ES/BQ，缓存靠 Redis 层处理。
+
+**第 2 层：Data Cache（跨请求缓存数据）**
+
+不同用户的不同请求之间共享 fetch 结果：
+
+```typescript
+// 用户 A 请求时 fetch 了数据并缓存
+// 用户 B 1 小时内请求同一页面，直接用缓存数据，不再 fetch
+const data = await fetch(url, { next: { revalidate: 3600 } });
+
+// 不缓存（每次都请求最新，如 AI 搜索接口）
+const data = await fetch(url, { cache: 'no-store' });
+```
+
+和第 1 层的区别：第 1 层是同一用户同一次渲染内去重；第 2 层是不同用户不同请求间共享。
+
+**第 3 层：Full Route Cache（缓存渲染好的页面）**
+
+就是 ISR 的底层实现。页面渲染完成后，HTML + RSC Payload 整体缓存：
+
+```typescript
+export const revalidate = 3600; // 页面级别的 ISR
+```
+
+和第 2 层的区别：第 2 层缓存的是**数据**（JSON），第 3 层缓存的是**页面**（HTML）。数据没过期但页面过期了，会用缓存数据重新渲染页面（不发请求但要跑渲染逻辑）。
+
+**第 4 层：Router Cache（客户端路由缓存）**
+
+唯一在浏览器端的缓存。用户点 `<Link>` 跳转时，Next.js 把页面缓存在客户端内存。按返回键秒开，不需要请求服务端。
+
+- 静态页面缓存 5 分钟
+- 动态页面缓存 30 秒
+- 刷新页面（F5）清除全部
+
+**四层的请求流转**：
+
+```
+用户请求一个页面：
+  ↓
+1. Router Cache 命中？→ 秒开，结束（客户端）
+  ↓ 未命中
+2. Full Route Cache 命中？→ 返回缓存 HTML，结束（服务端）
+  ↓ 未命中（需要渲染）
+3. 渲染页面，页面内的 fetch：
+   ├── Data Cache 命中？→ 用缓存数据
+   └── 同一次渲染重复 fetch？→ Request Memoization 去重
+  ↓
+4. 渲染完成 → 写入 Full Route Cache + Router Cache → 返回
+```
+
+**【项目关联 & 区别】**
+
+Next.js 这四层是框架内部的事，你的项目在这之外又加了两层：
+
+- **前面加了 SW + CDN**：请求到达 Next.js 之前就被拦截
+- **后面加了 Redis**：Next.js 的 Data Cache 是单机的，多 Pod 部署不共享。在 fetch 层加 Redis（TTL 7天）保证 GKE 多 Pod 数据一致
+
+完整路径：`SW → CDN → [Next.js 四层] → Redis → ES/BQ`
+
+**缓存失效策略**：
+
+- 时间失效：`revalidate` 兜底
+- 手动失效：后台编辑后调用 `revalidatePath`
+- Redis 失效：TTL + 手动 Purge API
+
+**多层联动失效**：
+
+```typescript
+async function invalidateArticle(slug: string) {
+  // 1. 失效 Next.js Full Route Cache + Data Cache
+  revalidatePath(`/article/${slug}`);
+  // 2. 失效 Redis
+  await redis.del(`article:detail:${slug}`);
+  // 3. 可选：失效 CDN
+  await cdnPurge(`/article/${slug}`);
+}
+```
+
+一次调用搞定所有层级。
+
+---
+
+### 2.5 generateStaticParams + 程序化 SEO
+
+【项目关联】AI 平台 1200 篇文章 x 3 种语言 = 3600+ 页面
+
+#### generateStaticParams 是什么
+
+动态路由（如 `app/[locale]/articles/[slug]/page.tsx`）中，Next.js 不知道有哪些 locale + slug 组合。`generateStaticParams` 的作用是**告诉 Next.js 有哪些路由需要在构建时预生成静态 HTML**。
+
+它取代了 Pages Router 时代的 `getStaticPaths`。
+
+```typescript
+// app/[locale]/articles/[slug]/page.tsx
+
+// 1. 告诉 Next.js 需要预生成哪些路由
+export async function generateStaticParams() {
+  const articles = await getHotArticles(100); // 只预生成热门 100 篇
+  return articles.flatMap(article => [
+    { locale: 'zh-id', slug: article.slug },
+    { locale: 'en-id', slug: article.slug },
+    { locale: 'id-id', slug: article.slug },
+  ]);
+  // 返回 300 个路由组合（100 篇 x 3 语言）
+}
+
+// 2. 页面组件通过 params 拿到对应的值，查数据渲染
+export default async function ArticlePage({ params }) {
+  const { locale, slug } = await params;
+  const article = await getArticle(slug);
+  return <ArticleDetail article={article} />;
+}
+```
+
+**构建时流程**：
+
+```
+next build 执行时：
+1. 调用 generateStaticParams() → 拿到 300 个路由组合
+2. 对每个组合执行页面渲染 → 生成 300 个静态 HTML 文件
+3. 输出：/zh-id/articles/sushi-tei/index.html
+         /en-id/articles/sushi-tei/index.html
+         ...
+```
+
+**和 ISR 的配合**：
+
+- `generateStaticParams` 返回的路由 → **构建时预生成**（SSG）
+- 没返回但 `dynamicParams = true`（默认）的路由 → **首次访问时生成并缓存**（ISR）
+- 设了 `dynamicParams = false` → 没返回的路由直接 404
+
+项目策略：**热门预生成 + 长尾按需**。`generateStaticParams` 只返回 Top 100 热门文章（构建快），其余 2300+ 篇靠 ISR 首次访问时按需生成。
+
+#### Sitemap 自动生成
+
+Sitemap 告诉搜索引擎"你的网站有哪些页面"。Next.js App Router 中用 `app/sitemap.ts` 生成，**构建时执行**。
+
+```typescript
+// app/sitemap.ts — 单个 sitemap
+export default async function sitemap() {
+  const articles = await getAllArticles();
+  return articles.map(article => ({
+    url: `https://qpon.com/${article.lang}/${article.slug}`,
+    lastModified: article.updatedAt,
+    changeFrequency: 'weekly',
+    priority: 0.8,
+  }));
+}
+// Next.js 自动在 /sitemap.xml 生成 XML 文件
+```
+
+页面量大时（单个 sitemap 上限 5 万条），用 `generateSitemaps` 分片：
+
+```typescript
+// app/sitemap.ts — 多语言分片
+export async function generateSitemaps() {
+  return [{ id: 'zh-id' }, { id: 'en-id' }, { id: 'id-id' }];
+}
+
+export default async function sitemap({ id }: { id: string }) {
+  const articles = await getArticlesByLocale(id);
+  return articles.map(article => ({
+    url: `https://qpon.com/${id}/articles/${article.slug}`,
+    lastModified: article.updatedAt,
+  }));
+}
+// 生成 /sitemap/0.xml、/sitemap/1.xml、/sitemap/2.xml
+// Next.js 自动生成 /sitemap.xml 索引文件指向它们
+```
+
+配了 ISR（`export const revalidate = 3600`）后，sitemap 也能定期重新生成，新增文章最多 1 小时自动出现在 sitemap 中。
+
+#### 结构化数据（JSON-LD）— 告诉 Google "这个页面是什么"
+
+在页面 HTML 中注入一段 JSON-LD 格式的结构化数据，搜索引擎读到后能理解页面内容的语义，从而在搜索结果中展示**富摘要（Rich Snippet）**。
+
+**不加结构化数据的搜索结果**：
+```
+Sushi Tei - QPON X
+https://qpon.com/zh-id/poi/restaurant/sushi-tei
+```
+
+**加了结构化数据的搜索结果**：
+```
+Sushi Tei - QPON X
+⭐ 4.5 (128 条评价) · $$ · 日料 · 雅加达
+https://qpon.com/zh-id/poi/restaurant/sushi-tei
+```
+
+项目中用 `StructuredData` 组件自动注入，支持三种页面类型：
+
+```tsx
+// POI 页面 → Restaurant Schema（评分、地址、价格、菜系）
+<StructuredData type="poi" data={poiDetail} locale={locale} />
+
+// 文章页面 → Article Schema（标题、作者、发布日期、关键词）
+<StructuredData type="article" data={article} locale={locale} />
+
+// 榜单页面 → ItemList Schema（排行榜中的餐厅列表）
+<StructuredData type="itemList" data={rankData} locale={locale} />
+```
+
+每个页面自动生成，不需要手动维护。新增文章或 POI 自动带上对应的结构化数据。
+
+#### 面包屑结构化数据 — 告诉 Google "页面在网站中的位置"
+
+`BreadcrumbSchema` 组件注入面包屑导航的 JSON-LD，搜索结果中显示层级路径：
+
+**不加面包屑**：
+```
+https://qpon.com/zh-id/jakarta/restaurant/sushi-tei
+```
+
+**加了面包屑**：
+```
+QPON X > Jakarta > Restaurants > Sushi Tei
+```
+
+```tsx
+<BreadcrumbSchema
+  locale="zh-id"
+  items={[
+    { name: 'Home', url: '/' },
+    { name: 'Jakarta', url: '/jakarta' },
+    { name: 'Restaurants', url: '/jakarta/restaurant' },
+    { name: 'Sushi Tei', url: '/jakarta/restaurant/sushi-tei' },
+  ]}
+/>
+```
+
+帮助 Google 理解网站结构，提升搜索结果的点击率。
+
+#### generateMetadata — 给页面设置 `<head>` 标签
+
+`generateMetadata` 是 Next.js App Router 中给页面设置**标题、描述、社交分享卡片、多语言关联**等 `<head>` 信息的函数。它取代了 Pages Router 时代的 `<Head>` 组件。
+
+它是 `async` 函数，可以直接 `await` 查数据库拿文章标题，不需要额外传 props：
+
+```typescript
+// app/[locale]/articles/[slug]/page.tsx
+export async function generateMetadata({ params }) {
+  const article = await getArticle(params.slug);
+
+  return {
+    // 浏览器标签页标题
+    title: article.title,
+
+    // 搜索引擎描述
+    description: article.description,
+
+    // 社交分享卡片（微信/Twitter/Facebook 分享时显示的图和文字）
+    openGraph: {
+      title: article.title,
+      description: article.description,
+      images: [article.coverImage],
+    },
+
+    // 多语言关联（Hreflang）— 告诉 Google 同一内容有多个语言版本
+    alternates: {
+      languages: {
+        'zh-ID': `/zh-id/articles/${params.slug}`,
+        'en': `/en-id/articles/${params.slug}`,
+        'id': `/id-id/articles/${params.slug}`,
+      },
+    },
+
+    // 规范链接（防重复内容）
+    canonical: `https://qpon.com/zh-id/articles/${params.slug}`,
+  };
+}
+```
+
+Next.js 会在页面 HTML 的 `<head>` 中自动生成：
+
+```html
+<head>
+  <title>米其林空降泗水就这？</title>
+  <meta name="description" content="泗水Pakuwon Mall的莆田餐厅..." />
+  <meta property="og:title" content="米其林空降泗水就这？" />
+  <meta property="og:image" content="https://cdn.qpon.com/cover.jpg" />
+  <link rel="alternate" hreflang="zh-ID" href="/zh-id/articles/..." />
+  <link rel="alternate" hreflang="en" href="/en-id/articles/..." />
+  <link rel="canonical" href="https://qpon.com/zh-id/articles/..." />
+</head>
+```
+
+**Hreflang 的作用**：告诉 Google 同一内容有多个语言版本，避免被判定为重复内容。Google 根据用户语言偏好展示对应版本，三种语言各自独立排名。
+
+#### SEO 完整体系总结
+
+项目中 SEO 相关的组件和函数，各自负责不同的部分：
+
+| 工具 | 放在哪 | 干什么 |
+|------|--------|--------|
+| `generateMetadata` | `<head>` | 标题、描述、OG 社交卡片、Hreflang、Canonical |
+| `StructuredData` | `<body>` 的 `<script>` | JSON-LD 结构化数据（评分、地址等富摘要） |
+| `BreadcrumbSchema` | `<body>` 的 `<script>` | JSON-LD 面包屑导航 |
+
+`generateMetadata` 管的是**页面基本信息**（给浏览器和搜索引擎看的 meta 标签），StructuredData / BreadcrumbSchema 管的是**语义化结构化数据**（给搜索引擎理解内容含义用的 JSON-LD）。三者配合才是完整的 SEO。
+
+完整 SEO 手段一览：
+
+| SEO 手段 | 实现方式 | 作用 |
+|---------|---------|------|
+| generateStaticParams | 构建时预生成热门页面 | 页面秒开，爬虫友好 |
+| Sitemap | `app/sitemap.ts` 自动生成 | 告诉 Google 有哪些页面 |
+| generateMetadata | 页面级 `async` 函数 | 标题/描述/OG 卡片/Hreflang/Canonical |
+| 结构化数据 | `StructuredData` 组件注入 JSON-LD | 搜索结果显示评分、价格等富摘要 |
+| 面包屑 | `BreadcrumbSchema` 组件注入 JSON-LD | 搜索结果显示导航路径 |
+
+效果：Lighthouse SEO 评分 92 分，上线 1 个月纯 SEO 流量 1200+ 用户。
+
+---
+
+### 2.6 Streaming & Suspense
+
+Streaming 是 Next.js 13+ 的重要特性，核心是**分块传输 HTML**，让用户更快看到内容。
+
+```typescript
+// app/search/page.tsx
+export default function SearchPage() {
+  return (
+    <div>
+      <SearchInput />  {/* 立即显示 */}
+
+      <Suspense fallback={<Skeleton />}>
+        <SearchResults />  {/* 数据 ready 后显示 */}
+      </Suspense>
+    </div>
+  );
+}
+
+// SearchResults 是 async Server Component
+async function SearchResults() {
+  const results = await searchArticles();  // 可能需要 2-3 秒
+  return <ResultList results={results} />;
+}
+```
+
+效果：用户立即看到搜索框和 Skeleton，2-3 秒后搜索结果 streaming 进来，比传统 SSR 白屏等待体验好很多。
+
+【项目关联】AI 平台的流式响应用 `ReadableStream` 把 LLM 输出实时推送给前端，前端边接收边渲染，首字 500ms 就能看到。
+
+**loading.js vs Suspense**：
+
+- `loading.js`：**页面级别**，整个路由切换时显示
+- `Suspense`：**组件级别**，更细粒度的 loading 状态
+- 通常两个都用：`loading.js` 处理路由切换，`Suspense` 处理页面内的异步组件
+
+---
+
+### 2.7 Middleware
+
+Middleware 在请求到达页面之前执行，适合做认证检查、重定向/重写、A/B 测试、国际化路由。
+
+【项目关联】AI 平台用 Middleware 做语言检测和重定向：
+
+```typescript
+// middleware.ts
+import { NextResponse } from 'next/server';
+
+export function middleware(request) {
+  const { pathname } = request.nextUrl;
+
+  // 已经有语言前缀，跳过
+  if (pathname.startsWith('/zh-id') || pathname.startsWith('/en')) {
+    return NextResponse.next();
+  }
+
+  // 根据 Accept-Language 检测语言
+  const lang = detectLanguage(request.headers.get('accept-language'));
+
+  // 重定向到对应语言版本
+  return NextResponse.redirect(new URL(`/${lang}${pathname}`, request.url));
+}
+
+export const config = {
+  matcher: ['/((?!api|_next/static|favicon.ico).*)'],
+};
+```
+
+注意事项：Middleware 运行在 Edge Runtime，不能用 Node.js API；要注意性能，每个请求都会执行。
+
+---
+
+## 三、浏览器与网络
+
+### 3.1 渲染流水线（关联：QPON 性能优化）
+
+```
+HTML -> DOM Tree
+                \
+                 -> Render Tree -> Layout -> Paint -> Composite
+                /
+CSS  -> CSSOM
+```
+
+**5个主要阶段**：
+
+1. **解析（Parse）**：HTML -> DOM Tree，CSS -> CSSOM，两者可以并行解析
+2. **样式计算（Style）**：合并 DOM + CSSOM -> Render Tree，计算每个节点的最终样式；`display: none` 的节点不进入 Render Tree
+3. **布局（Layout / Reflow）**：计算每个节点的几何信息（位置、大小），很耗性能
+4. **绘制（Paint）**：把节点绘制成像素，生成多个图层（Layer）
+5. **合成（Composite）**：将图层合并显示到屏幕，GPU 加速的关键步骤
+
+**性能优化点**：
+
+- 避免**重排（Reflow）**：改变布局属性（width、height、margin）
+- 避免**重绘（Repaint）**：改变视觉属性（color、background）
+- 用 `transform` 和 `opacity` 做动画，只触发合成，跳过布局和绘制
+
+---
+
+### 3.2 重排重绘
+
+**触发重排的常见操作**：
+
+- 几何属性变化：width、height、padding、margin、border
+- 位置变化：top、left、position
+- DOM 结构变化：添加/删除/移动节点
+- 读取布局信息：offsetWidth、scrollTop、getBoundingClientRect()
+
+**优化技巧**：
+
+```javascript
+// -- 读写交替，触发多次重排 --
+el.style.width = '100px';
+console.log(el.offsetWidth); // 强制重排
+el.style.height = '100px';
+console.log(el.offsetHeight); // 再次重排
+
+// -- 批量读、批量写 --
+const width = el.offsetWidth;
+const height = el.offsetHeight;
+el.style.width = '100px';
+el.style.height = '100px';
+```
+
+【项目关联】QPON 首页优化中，把多次 DOM 操作合并，减少了 70% 的重排次数。
+
+---
+
+### 3.3 Event Loop / 宏任务微任务
+
+JavaScript 是**单线程**的，通过事件循环实现异步。
+
+**一轮事件循环的完整流程**：
+
+```
+┌───────────────────────────┐
+│     执行一个宏任务          │ ← setTimeout 回调、I/O 回调等
+└─────────────┬─────────────┘
+              ↓
+┌───────────────────────────┐
+│     清空所有微任务          │ ← Promise.then、MutationObserver
+│  （包括微任务中新产生的）    │    递归执行，直到微任务队列为空
+└─────────────┬─────────────┘
+              ↓
+┌───────────────────────────┐
+│     渲染阶段（如果需要）    │ ← 浏览器判断是否需要渲染（通常 60fps = 每 16.6ms 一次）
+│     1. requestAnimationFrame│    rAF 是渲染阶段的一部分，在布局/绘制之前执行
+│     2. Layout（布局计算）    │
+│     3. Paint（绘制像素）     │
+│     4. Composite（合成）     │
+└─────────────┬─────────────┘
+              ↓
+        回到顶部，取下一个宏任务
+```
+
+注意：**渲染不是每轮都发生**。浏览器会根据需要决定——如果距离上次渲染不到 16.6ms 且没有视觉变化，会跳过渲染阶段直接取下一个宏任务。
+
+**微任务（Microtask）**：
+
+- Promise.then/catch/finally
+- MutationObserver
+- queueMicrotask()
+
+**宏任务（Macrotask）**：
+
+- setTimeout / setInterval
+- I/O 回调
+- 用户交互事件（click、scroll 等）
+
+**requestAnimationFrame**：既不是宏任务也不是微任务。它属于**渲染阶段**，在浏览器执行布局和绘制之前调用。适合做动画和 DOM 测量，因为能拿到最新的布局信息，且更新在下一帧立即可见。
+
+**微任务为什么优先级更高**：微任务在当前宏任务结束后**立即全部执行**（包括执行过程中新产生的微任务），然后才会取下一个宏任务或进入渲染。这保证了状态更新（如 Promise 回调）在下一次渲染前完成，不会出现中间状态。但也意味着：**如果微任务无限递归，会阻塞渲染和后续宏任务，页面卡死**。
+
+**经典面试题**：
+
+```javascript
+console.log('1');
+
+setTimeout(() => console.log('2'), 0);
+
+Promise.resolve().then(() => console.log('3'));
+
+console.log('4');
+
+// 输出：1 4 3 2
+// 同步(1,4) -> 微任务(3) -> 宏任务(2)
+```
+
+---
+
+### 3.4 Web Vitals 核心指标
+
+Google 用这些指标衡量用户体验。2024 年起，**三大核心指标（Core Web Vitals）** 变更为 LCP + INP + CLS（FID 被 INP 替代）。
+
+**三大核心指标（Core Web Vitals）**：
+
+| 指标 | 全称 | 测量什么 | 良好标准 |
+|------|------|---------|---------|
+| **LCP** | Largest Contentful Paint | 页面最大内容元素（通常是首屏大图或标题）何时渲染完成 | < 2.5s |
+| **INP** | Interaction to Next Paint | 整个页面生命周期内，**所有用户交互中最慢的那次**从点击到屏幕更新的延迟 | < 200ms |
+| **CLS** | Cumulative Layout Shift | 页面内容意外移动的程度（比如图片加载后把文字顶下去） | < 0.1 |
+
+**辅助指标**：
+
+| 指标 | 全称 | 测量什么 | 良好标准 |
+|------|------|---------|---------|
+| **FCP** | First Contentful Paint | 页面第一个内容元素（文字/图片）出现的时间 | < 1.8s |
+| **TTFB** | Time to First Byte | 浏览器收到服务器第一个字节的时间 | < 800ms |
+| **FID** | First Input Delay | 用户**第一次**交互时的延迟（已被 INP 替代，但面试还会问） | < 100ms |
+
+**FID vs INP 的区别**：
+
+- **FID**：只测量**第一次**交互的输入延迟（用户点击到浏览器开始处理的等待时间），不包括处理时间和渲染时间
+- **INP**：测量**所有交互中最慢的那次**，而且是完整的端到端延迟（输入延迟 + 处理时间 + 渲染时间）。更全面，更能反映真实体验
+
+```
+FID 只测这段：  用户点击 → [等待主线程空闲] → 开始处理
+INP 测完整链路：用户点击 → [等待] → [处理] → [渲染] → 屏幕更新
+```
+
+FID 可能很快（主线程碰巧空闲），但 INP 很慢（事件处理逻辑或渲染很重）。所以 Google 认为 INP 更能反映用户体验。
+
+【项目关联】AI 平台数据 -- LCP 2.8s、FCP 1.3s、CLS 0.02、TTFB 146ms (P95)。QPON 首屏关键数据上屏从 3s 降到 1.7s（降低 40%）。
+
+**优化手段**：
+
+- **LCP**：预加载关键图片（`<link rel="preload">`）、CDN 加速、SSR/ISR 减少白屏时间
+- **INP/FID**：减少主线程长任务（代码分割、`dynamic()` 延迟加载）、把重计算移到 Web Worker
+- **CLS**：预留图片/广告位尺寸（`width`/`height` 或 `aspect-ratio`）、避免动态插入内容推挤布局
+- **FCP**：减少关键资源阻塞（内联关键 CSS、defer 非关键 JS）
+- **TTFB**：服务端缓存（ISR + Redis）、CDN 边缘节点就近响应
+
+**测量方式**：
+
+```javascript
+// web-vitals 库（v4+）已用 onINP 替代 onFID
+import { onLCP, onINP, onCLS, onFCP, onTTFB } from 'web-vitals';
+
+onLCP(console.log);
+onINP(console.log);
+onCLS(console.log);
+onFCP(console.log);
+onTTFB(console.log);
+```
+
+实验室数据（开发阶段）用 Lighthouse / WebPageTest；现场数据（真实用户）用 Chrome UX Report 或 web-vitals JS 库自己埋点上报。两者可能差异很大——实验室数据是固定环境模拟，现场数据反映真实设备和网络条件。
+
+---
+
+### 3.5 HTTP 缓存（强缓存 vs 协商缓存）（关联：AI 平台四级缓存）
+
+| 类型         | 控制头                     | 特点                     | 适用场景                |
+| ------------ | -------------------------- | ------------------------ | ----------------------- |
+| **强缓存**   | `Cache-Control`、`Expires` | 不发请求，直接用本地     | 静态资源（JS/CSS/图片） |
+| **协商缓存** | `ETag`、`Last-Modified`    | 发请求验证，可能返回 304 | 可能变化的资源          |
+
+**强缓存**（不问服务器）：
+
+```
+Cache-Control: max-age=31536000  // 1年
+```
+
+- 在有效期内，浏览器直接用本地缓存
+- 适合**带 hash 的静态资源**（main.a1b2c3.js）
+- 更新时改文件名，强制刷新
+
+**协商缓存**（问服务器）：
+
+```
+ETag: "abc123"
+Last-Modified: Wed, 21 Oct 2025 07:28:00 GMT
+```
+
+- 浏览器带 `If-None-Match` / `If-Modified-Since` 请求
+- 服务器返回 304（未修改）或 200（新内容）
+- 适合 **HTML 入口文件**
+
+**CDN 缓存与浏览器缓存的关系**：
+
+```
+用户 -> [浏览器缓存] -> [CDN缓存] -> [源服务器]
+```
+
+- `max-age`：控制浏览器缓存
+- `s-maxage`：控制 CDN（共享）缓存，优先级更高
+
+【项目关联】AI 平台的缓存策略：
+
+- HTML：`no-cache`（每次验证，保证更新及时）
+- JS/CSS：`max-age=31536000`（1年，文件名带 hash）
+- API 数据：Redis 缓存 + `stale-while-revalidate`
+- ISR 页面：`s-maxage=3600, stale-while-revalidate`
+
+ISR 的核心原理就是 `stale-while-revalidate` 策略 -- CDN 缓存 1 小时，过期后先返回旧内容，后台异步更新。
+
+---
+
+### 3.6 CORS
+
+**同源**：协议 + 域名 + 端口 都相同
+
+```
+https://qpon.com/api        同源
+https://api.qpon.com/v1     跨域（子域名不同）
+http://qpon.com/api         跨域（协议不同）
+https://qpon.com:8080/api   跨域（端口不同）
+```
+
+**解决方案**：
+
+**1. CORS（推荐）** -- 服务端设置响应头：
+
+```
+Access-Control-Allow-Origin: https://qpon.com
+Access-Control-Allow-Methods: GET, POST, PUT
+Access-Control-Allow-Credentials: true
+```
+
+**2. 代理服务器** -- 开发环境用 webpack/vite 代理：
+
+```javascript
+// vite.config.js
+proxy: {
+  '/api': {
+    target: 'https://api.qpon.com',
+    changeOrigin: true,
+  }
+}
+```
+
+**简单请求 vs 预检请求**：
+
+**简单请求**（直接发送）：方法为 GET/HEAD/POST，只有简单头，Content-Type 仅限 text/plain、form-data、form-urlencoded
+
+**预检请求**（先发 OPTIONS）：使用 PUT/DELETE 等方法，有自定义头部（Authorization），Content-Type 是 application/json
+
+```
+OPTIONS /api/user HTTP/1.1
+Origin: https://qpon.com
+Access-Control-Request-Method: PUT
+Access-Control-Request-Headers: Content-Type, Authorization
+
+-> 服务器返回允许的方法和头部
+-> 然后才发真正的 PUT 请求
+```
+
+预检请求会增加一次往返，可以用 `Access-Control-Max-Age` 缓存。
+
+---
+
+### 3.7 Resource Hints（preload/prefetch/preconnect）
+
+| 标签           | 作用                               | 场景            |
+| -------------- | ---------------------------------- | --------------- |
+| `preload`      | 提前加载**当前页面**必需资源       | 字体、关键 CSS  |
+| `prefetch`     | 空闲时加载**下一页**可能用到的资源 | 下一页的 JS     |
+| `preconnect`   | 提前建立连接（DNS + TCP + TLS）    | 第三方 API 域名 |
+| `dns-prefetch` | 只做 DNS 解析                      | 更多第三方域名  |
+
+```html
+<!-- preload：告诉浏览器这个资源很重要，尽快加载 -->
+<link rel="preload" href="/fonts/Inter.woff2" as="font" crossorigin />
+<link rel="preload" href="/hero.jpg" as="image" />
+
+<!-- prefetch：浏览器空闲时加载，Next.js 的 <Link prefetch> 就是这个原理 -->
+<link rel="prefetch" href="/article/123.js" />
+
+<!-- preconnect：省去 DNS + TCP + TLS 握手时间（约 100-300ms） -->
+<link rel="preconnect" href="https://api.qpon.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+```
+
+【项目关联】QPON / AI 平台的 next.config.js 配置：
+
+```javascript
+async headers() {
+  return [{
+    source: '/:path*',
+    headers: [
+      { key: 'Link', value: '<https://fonts.gstatic.com>; rel=preconnect' },
+    ],
+  }];
+}
+```
+
+---
+
+## 四、工程化
+
+### 4.1 Webpack 核心流程
+
+```
+Entry -> Loaders -> Plugins -> Bundle
+```
+
+**5个阶段**：
+
+1. **初始化**：读取配置，创建 Compiler 对象
+2. **构建依赖图**：从 entry 开始，递归解析 `import/require`，形成模块依赖图（Module Graph）
+3. **Loader 转换**：对每个模块应用对应的 Loader（如 `.ts` -> `ts-loader` -> `.js`）
+4. **Plugin 处理**：在构建生命周期的各个钩子执行插件（如代码压缩、生成 HTML）
+5. **输出 Bundle**：合并模块，生成最终文件，代码分割、Tree Shaking
+
+---
+
+### 4.2 Vite 为什么快
+
+- **开发模式**：不打包，用浏览器原生 ESM，按需编译
+- **生产模式**：用 Rollup 打包
+- 冷启动从几十秒变成几百毫秒
+
+核心差异：Webpack 开发时也要打包所有模块，而 Vite 利用浏览器原生 ES Module 能力，只编译当前请求的模块。
+
+---
+
+### 4.3 Tree Shaking 原理
+
+Tree Shaking 是**移除未使用代码**的技术。
+
+**原理**：
+
+- 依赖 ES Module 的**静态分析**
+- `import/export` 在编译时就能确定依赖关系
+- 标记未使用的导出，打包时删除
+
+**前提条件**：
+
+- 必须用 ESM（`import/export`），CommonJS 不行
+- 代码不能有**副作用**
+
+```javascript
+// package.json
+{
+  "sideEffects": false  // 声明整个包无副作用
+}
+
+// 或者指定有副作用的文件
+{
+  "sideEffects": ["*.css", "*.scss"]
+}
+```
+
+实践：使用 `lodash-es` 而不是 `lodash`；组件库按需导入；用 Bundle Analyzer 确认无用代码被移除。
+
+---
+
+### 4.4 内存泄漏排查（关联：主题编辑器）
+
+**常见泄漏场景**：
+
+| 场景           | 原因                          | 解决方案                   |
+| -------------- | ----------------------------- | -------------------------- |
+| 定时器未清除   | `setInterval` 回调引用组件    | 组件卸载时 `clearInterval` |
+| 事件监听未移除 | `addEventListener` 后忘记移除 | `removeEventListener`      |
+| 闭包引用       | 闭包持有大对象                | 及时置空引用               |
+| DOM 引用       | JS 变量引用已删除的 DOM       | 删除 DOM 时置空变量        |
+| 全局变量       | 意外挂在 window 上            | 使用模块化、严格模式       |
+
+**排查方法**：
+
+1. **Chrome DevTools Memory 面板**：拍摄 Heap Snapshot，对比两次快照，看 Retained Size 大的对象
+2. **Performance Monitor**：观察 JS Heap Size 是否持续增长（正常情况波动但不持续上涨）
+3. **Memory 时间线**：录制操作，看内存变化，每次操作后是否回落
+
+【项目关联】OPPO 主题编辑器 undo/redo 内存泄漏：
+
+**问题**：undo/redo 功能导致内存从 50MB 涨到 200MB，最后崩溃。每次操作都**深拷贝整个画布状态**保存历史。
+
+**解决**：
+
+1. 改用 **Patch 理念**，只记录变化（`{ path: 'layer.1.x', old: 100, new: 150 }`）
+2. 历史记录超过 100 条时，**splice 删除旧记录**
+3. 图层预览用 **WeakMap**，图层删除后自动 GC
+
+**效果**：内存占用从 200MB 降到 20MB（降低 90%）。
+
+**WeakMap vs Map**：
+
+WeakMap 的 key 是弱引用，不阻止垃圾回收：
+
+```javascript
+const map = new Map();
+const weakMap = new WeakMap();
+
+let obj = { data: 'large' };
+
+map.set(obj, 'value');
+weakMap.set(obj, 'value');
+
+obj = null; // 解除引用
+
+// Map 中的 obj 仍然存在（强引用）
+// WeakMap 中的 obj 会被 GC（弱引用）
+```
+
+适用场景：存储 DOM 节点相关数据（节点删除后自动清理）；存储对象的私有数据；缓存计算结果（对象销毁后缓存自动失效）。
