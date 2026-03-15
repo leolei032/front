@@ -55,9 +55,42 @@
 
 **T - 思考**：不是零散做优化，而是建体系。拆解为四个环节：
 
-**第一步：指标定义**
+**第一步：指标定义 + 分段统计**
 - 定义关键指标：首屏关键数据上屏时间（自定义，比FCP更贴近业务）、LCP、FCP
 - 建立性能基线：iOS设备目标1s，安卓设备目标2s，低端机目标2.5s
+- **首屏耗时分段统计方案**（基于 `performance.timing` API）：
+
+```
+navigationStart ──→ requestStart ──→ responseEnd ──→ domContentLoadedEventEnd ──→ 接口返回
+   │── 阶段1 ──│──── 阶段2 ────│────── 阶段3 ──────│────── 阶段4 ──────│
+   (网络连接)      (文档下载)     (DOM解析+资源加载)     (业务接口耗时)
+```
+
+| # | 阶段 | 计算方式 | 数据来源 | 对应优化手段 |
+|---|------|---------|---------|------------|
+| 1 | 网络连接（DNS+TCP+SSL） | `requestStart - navigationStart` | performance.timing | CDN、预连接、DNS预解析 |
+| 2 | 文档下载 | `responseEnd - requestStart` | performance.timing | Gzip压缩、减小文档体积 |
+| 3 | DOM 解析 + 资源加载 | `domContentLoadedEventEnd - responseEnd` | performance.timing | 代码分割、懒加载、关键CSS内联 |
+| 4 | 业务接口耗时 | 接口返回时间 - 接口发起时间 | 手动打点（axios拦截器记录 `Date.now()` 差值） | 接口缓存、请求并行、数据预加载 |
+
+阶段 1-3 全部来自 `performance.timing` 同一时钟源，完全可信；阶段 4 用 `Date.now()` 差值，自身也是同一时钟源。阶段 3→4 之间的缝隙（DOMContentLoaded 完成 → 接口实际发起）作为辅助字段上报，用于校验数据质量。
+
+**为什么不拆更细？** `performance.timing` 支持更细粒度的拆分：
+
+```
+阶段1 可拆为：navigationStart → fetchStart → domainLookupEnd → connectEnd → requestStart
+                │─ 卸载/重定向 ─│──── DNS ────│──── TCP+SSL ────│
+
+阶段3 可拆为：responseEnd → domInteractive → domContentLoadedEventEnd
+                │── HTML 解析 ──│──── 同步JS执行+资源加载 ────│
+```
+
+但分析后选择 4 段而非更细的原因：
+1. **Capacitor WebView 是本地加载**，没有真实的 DNS/TCP/SSL（都是 0ms），拆了也没数据
+2. CDN 场景下 DNS 和 TCP 通常在 10ms 以内，优化空间极小
+3. 实际瓶颈 99% 落在阶段 3（DOM+资源）和阶段 4（接口），4 段划分粒度够用且易于监控
+
+> 补充：`performance.timing`（Navigation Timing Level 1）已标记 deprecated，新标准是 `PerformanceNavigationTiming`（Level 2），但在 Capacitor WebView 场景下旧 API 兼容性更好。面试时可主动提及了解新标准。
 
 **第二步：自动化卡点**
 - 搭建基于Node + Playwright + Lighthouse的自动化性能测试
