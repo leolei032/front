@@ -11,7 +11,7 @@
 
 **性能优化与工程化体系**：具备体系化的前端性能治理经验，主导QPON应用从指标定义→工具建设→流程卡点→线上数据分析的全链路性能优化，将首页关键内容上屏耗时降低40%（3s → 1.7s）
 
-**全栈开发与AI工程实践**：具备使用Next.js、Node.js、Elasticsearch、BigQuery、Redis构建全栈应用的能力。独立完成从产品设计、架构设计、前端开发、后端API设计、AI集成到部署运维的全流程交付（AI内容平台项目）
+**全栈开发与AI工程实践**：具备使用Next.js、Node.js、Elasticsearch、BigQuery、Redis构建全栈应用的能力。独立完成从产品设计、架构设计、全栈开发、AI集成到部署运维的全流程交付，具备事件驱动微服务架构设计与GCP云原生部署经验（AI内容平台、内容生产系统）
 
 **高并发优化与程序化SEO**：通过PWA + CDN + ISR + Redis四级缓存架构支撑QPS 900+高并发场景；实现120w+ 多语言落地页程序化SEO
 
@@ -58,6 +58,38 @@
 (1)参考Airbnb/Booking/TripAdvisor/Color UI设计系统，基于shadcn/ui封装qpon-ui组件库（30+组件），建立Design Tokens体系（42个设计令牌）
 
 (2)实现PC/Mobile/Tablet三端适配，根据设备特性自动适配交互模式
+
+### 2026年3月 – 至今
+
+**AI驱动的POI内容自动化生产系统**
+
+**项目概述**：
+
+独立设计基于事件驱动的三阶段微服务内容生产系统架构，并借助AI编程工具完成全栈交付。系统通过Radar发现→Enrichment富化→Article Generation生成的流水线，实现从Instagram社交媒体监控到多语言文章输出的全流程自动化。在架构设计、任务编排、爬虫性能调优、反爬对抗等方面积累了深度实践经验
+
+**技术栈**：Python + FastAPI + PostgreSQL + Google Gemini + GCP（Cloud Run + Pub/Sub + Cloud Scheduler）+ React + TypeScript + Ant Design
+
+**核心贡献**：
+
+1.设计POI流式事件驱动架构与任务编排机制
+
+(1)设计三阶段异步流水线，通过Google Cloud Pub/Sub实现服务间通信，每个POI作为独立消息即时流转，实现pipeline级并行，突破Cloud Run 600秒超时限制
+
+(2)设计智能调度策略：基于时间窗口过滤已处理账号避免重复执行，自动检测并重置超时的"running"状态（Cloud Run被kill的容错处理），消息自包含设计支持幂等重试
+
+2.爬虫内存优化与反爬对抗
+
+(1)Playwright内存治理：信号量控制并发页面数（max 3）防止OOM，全局单例浏览器上下文复用，Route拦截20+类无关资源（广告/字体/地图瓦片），Google评论采用"先滚动加载、后统一提取"的两阶段策略降低内存峰值
+
+(2)反爬体系：Redis分布式代理锁（Lua脚本原子释放）+ 代理健康评分排序 + 18组UA/视窗指纹轮换 + WebDriver特征隐藏 + 限流检测时热切换代理（复用浏览器进程，仅替换Context）
+
+3.微服务并发与稳定性优化
+
+(1)Cloud Run concurrency=1 + max-instances水平扩展模型，服务内asyncio.Semaphore + asyncio.gather实现图片下载(8并发)、数据查询、多语言生成的细粒度并行
+
+(2)定位并解决图片转存阻塞主流程导致Pub/Sub消息超时→无限重试的死循环问题，将非关键I/O移出关键路径
+
+4.开发Admin Dashboard（React + Ant Design），实现任务三阶段进度可视化、LLM配置热更新、Prompt库管理、文章预览质检
 
 ### 2023年12月 – 2025年10月
 
